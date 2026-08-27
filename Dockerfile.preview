@@ -46,16 +46,23 @@ WORKDIR /app
 # release this project needs lives in .meteor/release, and the launcher fetches
 # exactly that on first use — so this layer stays valid across release bumps and
 # the version has one source of truth in the repo rather than two.
-RUN curl -fsSL https://install.meteor.com/ | sh
-
-# The Meteor release itself, warmed. Copying only .meteor first means a source
-# edit does not invalidate this layer — the toolchain download is the slowest
-# part of a cold build and it changes only when .meteor/release changes.
+# Bootstrapper AND pinned release in ONE layer, with the caches dropped inside
+# it. Split across two RUNs, the installer's tarballs are frozen into the first
+# layer and deleting them later frees nothing — a layer can only add. This is
+# worth ~2 GB on an image that gets pulled onto every dev machine.
 COPY .meteor/release .meteor/release
 COPY .meteor/versions .meteor/versions
 COPY .meteor/packages .meteor/packages
 COPY .meteor/platforms .meteor/platforms
-RUN meteor --version
+RUN curl -fsSL https://install.meteor.com/ | sh \
+ && meteor --version \
+ # /root/.npm and /tmp are safe to drop. /root/.meteor/package-metadata is NOT:
+ # it is Meteor's package index, and Meteor installs some per-package npm deps
+ # at RUNTIME on first boot ("updating npm dependencies ..."). Without the index
+ # it cannot resolve them, so instead of self-healing it dies claiming it cannot
+ # find rspack.config.js — a message that points at the wrong file entirely. The
+ # real symptom is @meteorjs/rspack missing from node_modules.
+ && rm -rf /root/.npm /tmp/* 2>/dev/null || true
 
 # npm deps next, on their own layer for the same reason.
 # scripts/ comes along because package.json has a postinstall hook
@@ -65,21 +72,84 @@ RUN meteor --version
 # this layer nothing and keeps the dependency cache separate from the source.
 COPY package.json package-lock.json* ./
 COPY scripts ./scripts
-RUN meteor npm install --no-audit --no-fund
+RUN meteor npm install --no-audit --no-fund && rm -rf /root/.npm
 
 # Now the source, and the warm compile. `meteor build` populates .meteor/local
 # with the compiled bundle cache that makes the FIRST `meteor run` fast instead
 # of a full cold compile. The build output itself is thrown away — we want the
 # cache it leaves behind, not the artifact.
 COPY . .
+# NO --exclude-archs here: that flag exists on `meteor run`, NOT on `meteor
+# build`, which answers an unknown flag by printing its usage line and exiting 0.
+#
+# And this step is NOT allowed to fail softly any more. It used to end in
+# `|| echo "warm build failed ... still usable"`, which is how an image shipped
+# with .meteor/local at 4 KB instead of 258 MB — the entire warm cache missing,
+# no error anywhere, and the first boot dying on a half-built project. A warm
+# cache is the whole reason this image exists; if it cannot be built, the build
+# must fail here rather than hand someone a broken preview.
 RUN meteor build --directory /tmp/wekan-warm --server-only --allow-superuser \
-      || echo "[preview] warm build failed; the cache is partial and boot will be slower, but the image is still usable" \
- && rm -rf /tmp/wekan-warm
+ && du -sh /app/.meteor/local \
+ && rm -rf /tmp/wekan-warm /root/.npm 2>/dev/null || true
 
 # WRITABLE_PATH is required by server/00checkStartup.js, which exits the process
 # when it is unset or unwritable. Created here so the image is runnable on its
 # own; the compose file mounts a named volume over it so uploads persist.
 ENV WRITABLE_PATH=/data
+# ── Prune the package store to the versions this project actually pins ───────
+# /root/.meteor is 3.7 GB of a 7.08 GB image, and /root/.meteor/packages is 3.3 GB
+# of that — with meteor-tool alone at 1.5 GB and six compiler packages sitting at
+# a suspiciously uniform ~250 MB each. That shape is the store keeping EVERY
+# version it ever resolved, not the ones this project runs.
+#
+# The pull is the whole gap between this template and the design target: the app
+# itself serves in ~30s once the image is local, and the reference point is a
+# 1.25 GB image pulling in 52s. Nothing else on the critical path is worth
+# optimising until this number comes down.
+#
+# SAFE BY CONSTRUCTION. The keep-list is read from the project's own lockfiles —
+# .meteor/versions for packages, .meteor/release for the tool — so this can only
+# ever delete a version that is not pinned. If the duplicate-versions theory is
+# wrong, it deletes nothing and the size is unchanged; it cannot remove something
+# the build needs.
+#
+# WHAT IT MUST NOT TOUCH: /root/.meteor/package-metadata. Deleting that during an
+# earlier slimming attempt broke Meteor's ability to resolve npm dependencies at
+# RUNTIME on first boot, and the symptom was a confusing "cannot find
+# rspack.config.js" rather than anything naming the index. Only <name>/<version>
+# directories under packages/ are candidates here.
+RUN set -eu; \
+    store=/root/.meteor/packages; \
+    before=$(du -sm "$store" | cut -f1); \
+    keep=/tmp/keep.txt; : > "$keep"; \
+    # .meteor/versions is "package@version" per line.
+    sed -n 's/^\([a-zA-Z0-9_:-]*\)@\(.*\)$/\1 \2/p' /app/.meteor/versions >> "$keep"; \
+    # .meteor/release is "METEOR@x.y.z"; the store dir is packages/meteor-tool.
+    rel=$(sed -n 's/^METEOR@//p' /app/.meteor/release | tr -d '[:space:]'); \
+    [ -n "$rel" ] && echo "meteor-tool $rel" >> "$keep"; \
+    # Meteor writes ':' in package names as '_' on disk (e.g. meteortesting_mocha).
+    sed -i 's/:/_/' "$keep"; \
+    for pkgdir in "$store"/*; do \
+      [ -d "$pkgdir" ] || continue; \
+      name=$(basename "$pkgdir"); \
+      wanted=$(awk -v n="$name" '$1==n{print $2}' "$keep"); \
+      # A package with no entry in the keep-list is left ALONE, not deleted:
+      # absence means "this lockfile does not describe it", which is not the
+      # same as "it is unused" (the tool pulls its own deps).
+      [ -n "$wanted" ] || continue; \
+      for verdir in "$pkgdir"/*; do \
+        [ -d "$verdir" ] || continue; \
+        v=$(basename "$verdir"); \
+        echo "$wanted" | tr ' ' '\n' | grep -qx "$v" || rm -rf "$verdir"; \
+      done; \
+    done; \
+    rm -f "$keep"; \
+    after=$(du -sm "$store" | cut -f1); \
+    echo "[slim] package store ${before}MB -> ${after}MB (freed $((before-after))MB)"; \
+    # Prove the toolchain still resolves after the prune. Failing HERE is cheap;
+    # failing on a customer's first boot is not.
+    cd /app && meteor --version
+
 RUN mkdir -p /data
 
 EXPOSE 8080
