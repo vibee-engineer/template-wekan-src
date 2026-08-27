@@ -135,6 +135,31 @@ jobs:
             echo "::warning::preview image is ${gb} GB — the pull will dominate the customer's import wait (reference: 1.25 GB / 52s)"
           fi
 
+      - name: Where the size actually is
+        # The spike's reference is a 1.25 GB image pulled in 52s, reaching a
+        # working app in ~122s. This template is several times that, so the pull
+        # dominates the customer's import wait and the size is the only thing
+        # standing between us and the spike's number.
+        #
+        # A breakdown on every build, because the last two mistakes on this
+        # template both came from reasoning about the image instead of
+        # measuring it. Whoever does the slimming pass should not have to guess
+        # which directory to attack.
+        run: |
+          set -euo pipefail
+          img="preview:${{ steps.tag.outputs.tag }}"
+          echo "### Size breakdown" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          docker run --rm --entrypoint sh "$img" -c '
+            for d in /root/.meteor /root/.meteor/packages /app/node_modules \
+                     /app/.meteor/local /usr/local/lib/node_modules /opt; do
+              [ -e "$d" ] && du -sh "$d" 2>/dev/null || true
+            done
+            echo "--- 12 largest under /root/.meteor/packages ---"
+            du -sh /root/.meteor/packages/* 2>/dev/null | sort -rh | head -12 || true
+          ' | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
       - name: Boot the real stack and require WeKan's own markup
         env:
           PREVIEW_IMAGE: preview:${{ steps.tag.outputs.tag }}
