@@ -168,12 +168,19 @@ jobs:
           # against new source and pass on a lie.
           docker compose -f docker-compose.preview.yml down -v
 
+      # `inputs.push_image != false` looks right and is not: on a push or
+      # schedule event `inputs` is empty, so inputs.push_image is null, and
+      # GitHub's loose equality makes `null != false` evaluate FALSE. Both
+      # steps skipped on every non-dispatch run, so the push and schedule
+      # triggers built and boot-tested an image and then quietly published
+      # nothing — a green run that had not done the one thing it exists for.
+      # Only a manual dispatch can opt out.
       - name: Set up Fly CLI
-        if: ${{ inputs.push_image != false }}
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.push_image }}
         uses: superfly/flyctl-actions/setup-flyctl@master
 
       - name: Push to the Fly registry
-        if: ${{ inputs.push_image != false }}
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.push_image }}
         env:
           # A deploy token scoped to HOLDER_APP alone — deliberately not an
           # org-wide token. This repo is a fork of somebody else's project and
