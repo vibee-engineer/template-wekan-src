@@ -85,7 +85,23 @@ services:
       CHOKIDAR_USEPOLLING: "true"
       NODE_OPTIONS: --max-old-space-size=4096
     ports:
-      - "${PREVIEW_HOST_PORT:-8080}:8080"
+      # HOST PORT 8888 IS A PLATFORM CONTRACT, not a preference.
+      #
+      # founding.dev's fullstack tier proxies and health-checks host :8888 — the
+      # startup script polls http://localhost:8888/ and the control plane's
+      # app_http check hits the same URL. Publish anywhere else and the whole
+      # stack comes up perfectly while the platform reports
+      # "connect: connection refused" forever: containers Up, Mongo healthy,
+      # Meteor serving a real page on 8080, and app_http critical until the boot
+      # budget expires. Verified exactly that way on 2026-08-27 — curl inside the
+      # machine returned <title>Wekan</title> on 8080 and refused on 8888.
+      #
+      # WeKan itself still listens on 8080 INSIDE the container (see the --port
+      # flag below); only the host side moves.
+      #
+      # The env override stays so a developer can reproduce the stack locally on
+      # any free port: PREVIEW_HOST_PORT=8099 docker compose -f ... up
+      - "${PREVIEW_HOST_PORT:-8888}:8080"
     volumes:
       # WRITABLE_PATH. Named, not a bind: it holds uploaded attachments and
       # avatars, which are user data that must survive a container replacement.
