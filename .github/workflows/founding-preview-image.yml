@@ -1,0 +1,205 @@
+name: Founding preview image
+
+# Builds this template's prebuilt DEV PREVIEW image and pushes it to its holder
+# app in the Fly registry, where founding.dev's descriptor points at it via
+# `previewImage`.
+#
+# WHY THIS EXISTS AT ALL
+# An importing customer must not wait for a cold Meteor build — that is
+# 20-40 minutes on their critical path. So the image is built here, ahead of
+# time, and their machine only pulls it.
+#
+# WHY IT ALSO BOOTS THE IMAGE BEFORE PUSHING
+# This repo is a fork that nobody watches. The preview-image spike found the
+# previous template candidate did not build AT ALL by the time it was picked
+# up, and that failure would have landed on a customer mid-import. A workflow
+# that only builds proves the Dockerfile parses, not that the app runs. So the
+# smoke step starts the real compose stack and demands WeKan's own markup back
+# before anything is pushed.
+#
+# WHY amd64 IS ASSERTED
+# Fly machines are amd64. An arm64 image (what a build on an Apple-silicon Mac
+# produces) pulls onto a Fly machine perfectly happily and then refuses to run,
+# so the platform reports "We couldn't start your app" with nothing naming the
+# cause. That is exactly how it was first shipped. `--platform` can also be
+# silently ignored by an older buildx driver, so the architecture is checked
+# after the build rather than assumed from the flag.
+
+on:
+  # Push: this repo rotting undetected is the failure mode being defended
+  # against, so any change to the tree the image is built FROM rebuilds it.
+  push:
+    branches: [founding/preview-stack]
+    paths:
+      - 'Dockerfile.preview'
+      - 'docker-compose.preview.yml'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.meteor/**'
+      - 'scripts/**'
+      - '.github/workflows/founding-preview-image.yml'
+  # Schedule: upstream base images and OS packages move underneath a tree that
+  # has not changed, which is precisely the rot a push trigger cannot catch.
+  # Build-and-boot weekly so it fails in CI on a Monday instead of in front of
+  # a customer.
+  schedule:
+    - cron: '0 4 * * 1'
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Tag to push. Blank = the commit SHA prefix. Never "latest".'
+        required: false
+        default: ''
+        type: string
+      push_image:
+        description: 'Build and boot only, without pushing.'
+        required: false
+        default: true
+        type: boolean
+
+concurrency:
+  # These builds are long and disk-hungry; two at once on the same ref is waste.
+  group: preview-image-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The Fly app that exists only to own this image repository — it runs no
+  # machines. Same pattern as fdev-base.
+  HOLDER_APP: fdev-template-wekan-preview
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # A cold Meteor toolchain build is slow; failing at the default 360 min
+    # would burn a runner-hour to tell us nothing.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve the tag
+        id: tag
+        # Defaults to the commit SHA prefix, and refuses a mutable tag.
+        # founding.dev pins `previewImage` next to `pinnedSha` so an import is
+        # reproducible; a moving tag would pair old source with a new image,
+        # the exact failure that pinning exists to prevent. Its registry
+        # validator rejects :latest, and so does this.
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.image_tag }}"
+          [ -n "$TAG" ] || TAG="$(echo "${{ github.sha }}" | cut -c1-8)"
+          case "$TAG" in
+            latest|*:latest) echo "::error::image_tag must be immutable, not 'latest'"; exit 1 ;;
+          esac
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "building tag: $TAG"
+
+      - name: Free runner disk
+        # This image is multi-gigabyte and the runner has ~14 GB free by
+        # default, which the Meteor package store alone can exhaust. Dropping
+        # the preinstalled Android/.NET/GHC trees buys ~25 GB and costs nothing.
+        run: |
+          set -euo pipefail
+          df -h / | tail -1
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /usr/local/share/boost "${AGENT_TOOLSDIRECTORY:-}" || true
+          df -h / | tail -1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build (amd64)
+        run: |
+          set -euxo pipefail
+          docker build --platform linux/amd64 \
+            -f Dockerfile.preview \
+            -t "preview:${{ steps.tag.outputs.tag }}" .
+
+      - name: Assert amd64 and report size
+        run: |
+          set -euo pipefail
+          img="preview:${{ steps.tag.outputs.tag }}"
+          arch=$(docker image inspect "$img" --format '{{.Architecture}}')
+          if [ "$arch" != "amd64" ]; then
+            echo "::error::image is $arch — Fly machines are amd64, this would pull and then fail to run"
+            exit 1
+          fi
+          bytes=$(docker image inspect "$img" --format '{{.Size}}')
+          gb=$(awk -v b="$bytes" 'BEGIN{printf "%.2f", b/1024/1024/1024}')
+          echo "### Preview image: ${gb} GB (${arch})" >> "$GITHUB_STEP_SUMMARY"
+          echo "preview image: ${gb} GB ($arch)"
+          # A warning, not a failure: size is a judgement about how long a
+          # customer waits, and a human should see the number every time. The
+          # spike's reference is 1.25 GB pulled in 52s; past ~5 GB the pull
+          # dominates the whole import.
+          if [ "$(awk -v g="$gb" 'BEGIN{print (g>5)?1:0}')" = "1" ]; then
+            echo "::warning::preview image is ${gb} GB — the pull will dominate the customer's import wait (reference: 1.25 GB / 52s)"
+          fi
+
+      - name: Boot the real stack and require WeKan's own markup
+        env:
+          PREVIEW_IMAGE: preview:${{ steps.tag.outputs.tag }}
+          PREVIEW_HOST_PORT: '8099'
+        run: |
+          set -euo pipefail
+          docker compose -f docker-compose.preview.yml up -d
+          ok=0
+          # Generous on purpose: a dev server on a cold named volume compiles on
+          # first boot. This gate asks "does it EVER serve", not how fast.
+          for i in $(seq 1 120); do
+            body=$(curl -fsS --max-time 10 http://localhost:8099/ 2>/dev/null || true)
+            case "$body" in
+              # NOT a status code. server/00checkStartup.js exits the process
+              # when WRITABLE_PATH is unset or unwritable, and it does so AFTER
+              # Meteor starts listening — so the failure is an HTTP 200
+              # rendering "Meteor App - Error". Anything checking for a 200
+              # would call that healthy.
+              *"<title>Wekan"*) ok=1; echo "served WeKan after ~$((i*10))s"; break ;;
+            esac
+            sleep 10
+          done
+          if [ "$ok" != "1" ]; then
+            echo "::error::stack never served WeKan's title on /"
+            echo "--- ps ---";   docker compose -f docker-compose.preview.yml ps
+            echo "--- logs ---"; docker compose -f docker-compose.preview.yml logs --tail 250
+            exit 1
+          fi
+          # -v matters: named volumes seed from the image exactly ONCE, so a
+          # leftover volume would let the next run boot old dependencies
+          # against new source and pass on a lie.
+          docker compose -f docker-compose.preview.yml down -v
+
+      - name: Set up Fly CLI
+        if: ${{ inputs.push_image != false }}
+        uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Push to the Fly registry
+        if: ${{ inputs.push_image != false }}
+        env:
+          # A deploy token scoped to HOLDER_APP alone — deliberately not an
+          # org-wide token. This repo is a fork of somebody else's project and
+          # should not hold credentials that reach anything but its own image.
+          FLY_API_TOKEN: ${{ secrets.FLY_PREVIEW_PUSH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${FLY_API_TOKEN:-}" ]; then
+            echo "::error::FLY_PREVIEW_PUSH_TOKEN is not set on this repository."
+            echo "Create one scoped to the holder app only:"
+            echo "  flyctl tokens create deploy -a ${HOLDER_APP}"
+            echo "then add it as the FLY_PREVIEW_PUSH_TOKEN repo secret."
+            exit 1
+          fi
+          flyctl auth docker
+          ref="registry.fly.io/${HOLDER_APP}:${{ steps.tag.outputs.tag }}"
+          docker tag "preview:${{ steps.tag.outputs.tag }}" "$ref"
+          docker push "$ref"
+          {
+            echo "### Pushed"
+            echo '```'
+            echo "$ref"
+            echo '```'
+            echo "In founding.dev, set BOTH lines together in \`server/templates/wekan-boards.yaml\`:"
+            echo '```yaml'
+            echo "pinnedSha: ${{ github.sha }}"
+            echo "previewImage: $ref"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
