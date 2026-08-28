@@ -53,8 +53,12 @@ COPY . .
 # --server-only: no mobile targets, nothing here ships a Cordova app.
 # Excluding the legacy browser arch roughly halves the client build and drops
 # support for browsers WeKan's own UI does not target anyway.
-RUN meteor build --directory /build --server-only --allow-superuser \
-      --exclude-archs web.browser.legacy,web.cordova
+# --exclude-archs is a `meteor run` / `meteor test` flag. `meteor build` does not
+# accept it: it exits 1 and prints its usage, so this image could never build.
+# Verified against Meteor 3.5.2-beta.0 on a real publish 2026-08-28 and against
+# the Meteor CLI docs. Dropping it means the legacy browser bundle is built too —
+# slower, and the only correct option, since there is no build-side equivalent.
+RUN meteor build --directory /build --server-only --allow-superuser
 
 # The bundle declares its own server-side npm dependencies, which have to be
 # installed against the RUNTIME node version, not the build one. They are the
