@@ -1,0 +1,111 @@
+# docker-compose.preview.yml — the founding.dev DEV PREVIEW stack.
+#
+# founding.dev's agent daemon looks for this filename specifically and lets it
+# override every other compose file in the repo, so this is the one that decides
+# what a customer's editable preview actually runs. The production composes next
+# to it are untouched and still describe the real deployment.
+#
+# THREE THINGS HERE ARE LOad-BEARING. Changing any of them silently breaks the
+# preview in a way that looks like "the app is just slow" or "the app is hung":
+#
+# 1. `image:`, never `build:`. The whole point is that CI already built this. A
+#    `build:` here puts the multi-minute Meteor compile back on the customer's
+#    critical path, which is the problem this file exists to remove.
+#
+# 2. The named volumes over node_modules and .meteor/local. The bind mount below
+#    shadows everything the image baked under /app. Without these two the
+#    container starts with no dependencies and no compile cache and rebuilds
+#    from nothing — slower than having no preview image at all.
+#
+# 3. `command:` is a ONE-ELEMENT LIST. A bare string gets shell-split by compose
+#    and everything after the first && disappears without an error.
+#
+# NAMED VOLUMES SEED FROM THE IMAGE EXACTLY ONCE. When this template moves to a
+# new SHA, an existing machine keeps the OLD node_modules and .meteor/local —
+# Docker only populates a named volume while it is empty. Any rollout to running
+# previews has to remove these volumes or version their names, or every existing
+# preview quietly runs stale dependencies against new source.
+
+services:
+  wekandb:
+    image: mongo:7
+    restart: unless-stopped
+    # WeKan needs a replica set, not a bare mongod: it uses change streams for
+    # live board updates, and those do not exist on a standalone server. The
+    # loop initiates rs0 on first boot and is a no-op afterwards.
+    command: >
+      sh -c '
+        mongod --replSet rs0 --bind_ip_all --quiet --oplogSize 512 &
+        until mongosh --host 127.0.0.1 --quiet --eval "
+          try { quit(rs.status().ok === 1 ? 0 : 1) }
+          catch (e) { rs.initiate({_id:\"rs0\",members:[{_id:0,host:\"wekandb:27017\"}]}); quit(1) }
+        " >/dev/null 2>&1; do sleep 2; done
+        wait
+      '
+    healthcheck:
+      test: ["CMD", "mongosh", "--host", "127.0.0.1", "--quiet", "--eval", "try { quit(rs.status().ok === 1 && db.hello().isWritablePrimary ? 0 : 1) } catch (e) { quit(1) }"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+      start_period: 20s
+    volumes:
+      - wekan-preview-db:/data/db
+    expose:
+      - 27017
+
+  wekan:
+    # Set by CI / the platform. The local default lets a developer reproduce the
+    # stack with the image they just built by hand.
+    image: ${PREVIEW_IMAGE:-wekan-preview:local}
+    restart: unless-stopped
+    depends_on:
+      wekandb:
+        condition: service_healthy
+    environment:
+      # 127.0.0.1 in ROOT_URL would be fine for the browser but WeKan also uses
+      # it server-side to build absolute links; the platform rewrites this to the
+      # real preview hostname when it fronts the container.
+      ROOT_URL: ${ROOT_URL:-http://localhost:8080}
+      MONGO_URL: mongodb://wekandb:27017/wekan?replicaSet=rs0
+      # REQUIRED. server/00checkStartup.js hard-exits the process when this is
+      # unset or unwritable — and it does so AFTER Meteor has started serving, so
+      # the symptom is an HTTP 200 that renders Meteor's error page rather than a
+      # container that fails to come up. Anything checking only for a 200 would
+      # call that healthy.
+      WRITABLE_PATH: /data
+      # No PORT here on purpose. With PORT set alongside a --port flag, Meteor
+      # 3.5's Rspack dev server derives its HMR port as NaN and dies with
+      # ERR_SOCKET_BAD_PORT before its first compilation — see the command below.
+      WITH_API: "true"
+      # Meteor's file watcher does not see writes from a bind-mounted host FS on
+      # macOS or on Fly's fuse-overlayfs. Without polling an AI edit lands on
+      # disk and nothing recompiles — the exact "it saved but nothing happened"
+      # failure that makes hot reload look broken.
+      METEOR_WATCH_POLLING_INTERVAL_MS: "1000"
+      CHOKIDAR_USEPOLLING: "true"
+      NODE_OPTIONS: --max-old-space-size=4096
+    ports:
+      - "${PREVIEW_HOST_PORT:-8080}:8080"
+    volumes:
+      # WRITABLE_PATH. Named, not a bind: it holds uploaded attachments and
+      # avatars, which are user data that must survive a container replacement.
+      - wekan-preview-data:/data
+      # The editable tree. Everything below re-exposes a baked directory this
+      # mount would otherwise hide.
+      - .:/app
+      - wekan-preview-node-modules:/app/node_modules
+      - wekan-preview-meteor-local:/app/.meteor/local
+    # BARE PORT, not 0.0.0.0:8080. Meteor accepts the host:port form, but its
+    # Rspack dev server then computes its own HMR port from it and gets NaN,
+    # dying with ERR_SOCKET_BAD_PORT before the first compilation finishes. A
+    # bare port binds all interfaces inside the container anyway, which is what
+    # the host:port form was reaching for.
+    command:
+      - "meteor run --port 8080 --allow-superuser --exclude-archs web.browser.legacy,web.cordova"
+    entrypoint: ["sh", "-c"]
+
+volumes:
+  wekan-preview-db:
+  wekan-preview-data:
+  wekan-preview-node-modules:
+  wekan-preview-meteor-local:

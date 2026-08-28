@@ -1,0 +1,84 @@
+# docker-compose.prod.yml — the PRODUCTION stack founding.dev's Publish builds.
+#
+# founding.dev's prod transform looks for compose files in this order:
+#   docker-compose.prod.yml → docker-compose.yml → compose.yml → compose.yaml
+# so this file wins over the upstream compose next to it, which is what we want:
+# upstream's describes running a PREBUILT release image, and this one describes
+# building the customer's source.
+#
+# THE WHOLE POINT: `build:`, not `image:`.
+#
+# Upstream's Dockerfile downloads a prebuilt WeKan release .zip. Deploy that and
+# the customer's edits are simply absent from production — no error, no warning,
+# their afternoon of work replaced by stock WeKan. Dockerfile.prod builds the
+# tree that was actually edited, and this file is what points production at it.
+
+services:
+  wekandb:
+    image: mongo:7
+    restart: unless-stopped
+    # A replica set, not a bare mongod: WeKan uses change streams for live board
+    # updates and they do not exist on a standalone server. The loop initiates
+    # rs0 on first boot and is a no-op on every boot after.
+    command: >
+      sh -c '
+        mongod --replSet rs0 --bind_ip_all --quiet --oplogSize 1024 &
+        until mongosh --host 127.0.0.1 --quiet --eval "
+          try { quit(rs.status().ok === 1 ? 0 : 1) }
+          catch (e) { rs.initiate({_id:\"rs0\",members:[{_id:0,host:\"wekandb:27017\"}]}); quit(1) }
+        " >/dev/null 2>&1; do sleep 2; done
+        wait
+      '
+    healthcheck:
+      test: ["CMD", "mongosh", "--host", "127.0.0.1", "--quiet", "--eval", "try { quit(rs.status().ok === 1 && db.hello().isWritablePrimary ? 0 : 1) } catch (e) { quit(1) }"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 40s
+    volumes:
+      # Customer data. Named so it survives a machine replacement — losing this
+      # loses every board they have.
+      - wekan-db:/data/db
+    expose:
+      - 27017
+
+  wekan:
+    build:
+      context: .
+      dockerfile: Dockerfile.prod
+    restart: unless-stopped
+    depends_on:
+      wekandb:
+        condition: service_healthy
+    environment:
+      # Rewritten by the platform to the app's real public URL at publish time.
+      # Not cosmetic: Meteor builds absolute URLs from it server-side, so a wrong
+      # value gives an app that renders and then fails every asset and DDP
+      # connection — it looks like a broken deploy rather than a config error.
+      ROOT_URL: ${ROOT_URL:-http://localhost:8080}
+      PORT: "8080"
+      MONGO_URL: mongodb://wekandb:27017/wekan?replicaSet=rs0
+      # REQUIRED. server/00checkStartup.js exits the process when this is unset
+      # or unwritable — and it does so AFTER the server starts listening, so the
+      # symptom is an HTTP 200 rendering an error page. The health gate below
+      # checks for real content precisely because a status code cannot tell those
+      # apart.
+      WRITABLE_PATH: /data
+      WITH_API: "true"
+    volumes:
+      # Uploaded attachments and avatars. User data, so named and durable.
+      - wekan-files:/data
+    ports:
+      - "8080:8080"
+    healthcheck:
+      # Greps for the app's own title rather than trusting the status code — see
+      # WRITABLE_PATH above. A 200 is not proof this app is alive.
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/ | grep -q '<title>Wekan' || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 120s
+
+volumes:
+  wekan-db:
+  wekan-files:

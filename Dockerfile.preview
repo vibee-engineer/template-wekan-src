@@ -1,0 +1,98 @@
+# Dockerfile.preview — the founding.dev DEV image for this template.
+#
+# WHAT THIS IS FOR
+# When someone imports this template we boot a dev server they can edit with AI
+# and see change immediately. Building WeKan from source on that machine, on the
+# critical path, costs tens of minutes. This image does that work ahead of time
+# in CI so the import is a pull instead of a build.
+#
+# WHY IT CANNOT REUSE THE PRODUCTION Dockerfile
+# The production Dockerfile does not build the working tree at all — it fetches
+# a prebuilt WeKan release .zip and unpacks it. That is correct for shipping a
+# pinned release and useless for us: a customer's edits would never appear,
+# because the source they edited is not what runs. This image runs `meteor run`
+# against the mounted tree, which is the only way an edit reaches the page.
+#
+# THE BIND-MOUNT RULE (the one that bites)
+# docker-compose.preview.yml bind-mounts the repo over /app, and a bind mount
+# shadows EVERY path the image build wrote underneath it. Each warm directory
+# baked here must be re-exposed as a named volume in that compose file or it
+# vanishes at runtime. For this template that is:
+#
+#   /app/node_modules      npm deps
+#   /app/.meteor/local     Meteor's compiled bundle cache — the expensive one
+#
+# Miss either and the container spends the boot rebuilding what this image
+# already contains, which defeats the whole point.
+FROM node:24-bookworm
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    METEOR_ALLOW_SUPERUSER=true \
+    NODE_OPTIONS=--max-old-space-size=4096 \
+    # Meteor phones home on every command; nothing here needs it and it adds
+    # seconds to a cold container.
+    METEOR_DISABLE_ANALYTICS=1
+
+# Meteor's own build toolchain needs a compiler for native npm modules
+# (bcrypt, fibers-era leftovers). git is required by Meteor's package resolver.
+RUN apt-get update -qq \
+ && apt-get install -y -qq --no-install-recommends \
+      build-essential python3 git curl ca-certificates procps \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Meteor is installed as a BOOTSTRAPPER, not pinned to a version here. The
+# release this project needs lives in .meteor/release, and the launcher fetches
+# exactly that on first use — so this layer stays valid across release bumps and
+# the version has one source of truth in the repo rather than two.
+RUN curl -fsSL https://install.meteor.com/ | sh
+
+# The Meteor release itself, warmed. Copying only .meteor first means a source
+# edit does not invalidate this layer — the toolchain download is the slowest
+# part of a cold build and it changes only when .meteor/release changes.
+COPY .meteor/release .meteor/release
+COPY .meteor/versions .meteor/versions
+COPY .meteor/packages .meteor/packages
+COPY .meteor/platforms .meteor/platforms
+RUN meteor --version
+
+# npm deps next, on their own layer for the same reason.
+# scripts/ comes along because package.json has a postinstall hook
+# (`node scripts/patch-yargs-dirname.cjs`) that runs as part of the install. With
+# only package.json copied, npm install dies at the very end with a bare
+# "command failed" and no mention of the missing file. It is 8 KB, so it costs
+# this layer nothing and keeps the dependency cache separate from the source.
+COPY package.json package-lock.json* ./
+COPY scripts ./scripts
+RUN meteor npm install --no-audit --no-fund
+
+# Now the source, and the warm compile. `meteor build` populates .meteor/local
+# with the compiled bundle cache that makes the FIRST `meteor run` fast instead
+# of a full cold compile. The build output itself is thrown away — we want the
+# cache it leaves behind, not the artifact.
+COPY . .
+RUN meteor build --directory /tmp/wekan-warm --server-only --allow-superuser \
+      || echo "[preview] warm build failed; the cache is partial and boot will be slower, but the image is still usable" \
+ && rm -rf /tmp/wekan-warm
+
+# WRITABLE_PATH is required by server/00checkStartup.js, which exits the process
+# when it is unset or unwritable. Created here so the image is runnable on its
+# own; the compose file mounts a named volume over it so uploads persist.
+ENV WRITABLE_PATH=/data
+RUN mkdir -p /data
+
+EXPOSE 8080
+
+# ONE-ELEMENT LIST, deliberately. A bare string under a list-form entrypoint gets
+# shell-split by compose, and everything after the first && is silently dropped —
+# a failure mode that looks like the command simply never ran.
+#
+# --port 0.0.0.0:8080 because binding loopback inside a container is unreachable
+# through the port map, and the platform's HOSTNAME/HOST env coaxing does not
+# reach a Meteor CLI flag.
+# Bare --port, not 0.0.0.0:8080: with the host:port form Meteor 3.5's Rspack dev
+# server derives its HMR port as NaN and exits with ERR_SOCKET_BAD_PORT before
+# finishing its first compilation. A bare port already binds all interfaces
+# inside a container.
+CMD ["sh", "-c", "meteor run --port 8080 --allow-superuser --exclude-archs web.browser.legacy,web.cordova"]

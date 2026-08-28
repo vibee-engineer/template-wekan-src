@@ -1,0 +1,98 @@
+# Dockerfile.prod — the production image founding.dev's Publish builds.
+#
+# WHY THIS EXISTS INSTEAD OF THE UPSTREAM Dockerfile
+# The Dockerfile next to this one does not build the working tree. It downloads a
+# prebuilt WeKan release .zip and unpacks it. For upstream that is exactly right:
+# they are shipping a pinned, reproducible release of their own code.
+#
+# For us it is silently destructive. A customer imports this template, spends an
+# afternoon having the AI change their board columns and branding, presses
+# Publish — and gets stock WeKan, because the .zip does not contain a single line
+# they wrote. No error, no warning; their work is simply not in the artifact.
+#
+# So production builds from source, the same source the preview edited.
+#
+# This is a two-stage build because a Meteor bundle needs the whole Meteor
+# toolchain (~1.5 GB) to produce and none of it to run.
+
+# ── Stage 1: build the bundle from the working tree ──────────────────────────
+FROM node:24-bookworm AS build
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    METEOR_ALLOW_SUPERUSER=true \
+    METEOR_DISABLE_ANALYTICS=1 \
+    NODE_OPTIONS=--max-old-space-size=4096
+
+RUN apt-get update -qq \
+ && apt-get install -y -qq --no-install-recommends \
+      build-essential python3 git curl ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+
+# Toolchain first, on its own layer: it is the slowest part of a cold build and
+# it only changes when .meteor/release does.
+RUN curl -fsSL https://install.meteor.com/ | sh
+COPY .meteor/release .meteor/release
+COPY .meteor/versions .meteor/versions
+COPY .meteor/packages .meteor/packages
+COPY .meteor/platforms .meteor/platforms
+RUN meteor --version
+
+# scripts/ comes along because package.json has a postinstall hook
+# (`node scripts/patch-yargs-dirname.cjs`) that runs as part of the install. With
+# only package.json copied, npm install dies at the very end with a bare
+# "command failed" and no mention of the missing file. It is 8 KB, so it costs
+# this layer nothing and keeps the dependency cache separate from the source.
+COPY package.json package-lock.json* ./
+COPY scripts ./scripts
+RUN meteor npm install --no-audit --no-fund
+
+COPY . .
+
+# --server-only: no mobile targets, nothing here ships a Cordova app.
+# Excluding the legacy browser arch roughly halves the client build and drops
+# support for browsers WeKan's own UI does not target anyway.
+# --exclude-archs is a `meteor run` / `meteor test` flag. `meteor build` does not
+# accept it: it exits 1 and prints its usage, so this image could never build.
+# Verified against Meteor 3.5.2-beta.0 on a real publish 2026-08-28 and against
+# the Meteor CLI docs. Dropping it means the legacy browser bundle is built too —
+# slower, and the only correct option, since there is no build-side equivalent.
+RUN meteor build --directory /build --server-only --allow-superuser
+
+# The bundle declares its own server-side npm dependencies, which have to be
+# installed against the RUNTIME node version, not the build one. They are the
+# same major here, but installing them in this stage is what lets the runtime
+# stage carry no toolchain at all.
+WORKDIR /build/bundle/programs/server
+RUN npm install --omit=dev --no-audit --no-fund
+
+# ── Stage 2: runtime ─────────────────────────────────────────────────────────
+# Slim, no Meteor, no compiler. Everything needed to run is inside the bundle.
+FROM node:24-bookworm-slim AS runtime
+
+ENV NODE_ENV=production \
+    PORT=8080 \
+    WITH_API=true
+
+# curl is here ONLY for the healthcheck. Without a healthcheck the platform's
+# deploy gate cannot tell "booted" from "listening but broken", and a Meteor app
+# answers TCP well before it answers HTTP.
+RUN apt-get update -qq \
+ && apt-get install -y -qq --no-install-recommends curl ca-certificates \
+ && rm -rf /var/lib/apt/lists/* \
+ && useradd -r -u 10001 -m wekan
+
+COPY --from=build --chown=wekan:wekan /build/bundle /app
+
+WORKDIR /app
+USER wekan
+EXPOSE 8080
+
+HEALTHCHECK --interval=15s --timeout=5s --start-period=90s --retries=10 \
+  CMD curl -fsS "http://127.0.0.1:${PORT}/" >/dev/null || exit 1
+
+# MONGO_URL and ROOT_URL come from the environment. ROOT_URL is not cosmetic:
+# Meteor builds absolute URLs from it server-side, so a wrong value produces an
+# app that renders and then fails every asset and DDP connection.
+CMD ["node", "main.js"]
